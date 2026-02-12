@@ -36,7 +36,7 @@ fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-fn add_recursive(encoder: &mut ItafEncoder<File>, path: &Path) -> io::Result<()> {
+fn add_recursive(encoder: &mut ItafEncoder<File>, path: &Path) -> std::io::Result<()> {
     // 1. Get filesystem metadata
     let fs_meta = fs::symlink_metadata(path)?;
     let file_type = fs_meta.file_type();

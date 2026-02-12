@@ -28,7 +28,7 @@ fn main() -> std::io::Result<()> {
         let target_path = output_dir.join(safe_path);
 
         match &mut entry {
-            ArchiveEntry::Directory(dir) => {
+            ArchiveEntry::Directory(_dir) => {
                 println!("Dir:  {:?}", target_path);
                 fs::create_dir_all(&target_path)?;
 

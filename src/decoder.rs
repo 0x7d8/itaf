@@ -37,6 +37,64 @@ pub struct FileEntry<R: Read> {
     size: u64,
 }
 
+impl<R: Read> FileEntry<R> {
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    pub fn metadata(&self) -> &Metadata {
+        &self.meta
+    }
+
+    pub fn enclosed_path(&self) -> PathBuf {
+        sanitize_path(&self.path)
+    }
+
+    pub fn crc64(&self) -> Option<u64> {
+        let st = self.state.borrow();
+
+        if st.bytes_remaining == 0 && st.checksum_consumed {
+            st.last_crc_valid
+        } else {
+            None
+        }
+    }
+}
+
+impl<R: Read> Read for FileEntry<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut st = self.state.borrow_mut();
+
+        if st.bytes_remaining == 0 {
+            st.consume_checksum()?;
+            return Ok(0);
+        }
+
+        let max = std::cmp::min(buf.len() as u64, st.bytes_remaining);
+        let n = st.reader.read(&mut buf[0..max as usize])?;
+
+        if n == 0 && st.bytes_remaining > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Truncated file",
+            ));
+        }
+
+        st.bytes_remaining -= n as u64;
+
+        if st.bytes_remaining == 0 {
+            st.consume_checksum()?;
+        }
+        Ok(n)
+    }
+}
+
+impl<R: Read> Drop for FileEntry<R> {
+    fn drop(&mut self) {
+        let _ = self.state.borrow_mut().drain_active_file();
+    }
+}
+
 pub struct DirEntry {
     pub(crate) path: PathBuf,
     pub(crate) meta: Metadata,
@@ -46,9 +104,11 @@ impl DirEntry {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
     pub fn metadata(&self) -> &Metadata {
         &self.meta
     }
+
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(&self.path)
     }
@@ -65,18 +125,23 @@ impl SymlinkEntry {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
     pub fn target(&self) -> &Path {
         &self.target
     }
-    pub fn is_dir(&self) -> bool {
+
+    pub fn is_target_dir(&self) -> bool {
         self.is_dir
     }
+
     pub fn metadata(&self) -> &Metadata {
         &self.meta
     }
+
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(&self.path)
     }
+
     pub fn enclosed_target(&self) -> PathBuf {
         sanitize_path(&self.target)
     }
@@ -96,9 +161,11 @@ impl<R: Read> ArchiveEntry<R> {
             Self::Symlink(e) => &e.path,
         }
     }
+
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(self.path())
     }
+
     pub fn metadata(&self) -> &Metadata {
         match self {
             Self::File(e) => &e.meta,
@@ -332,62 +399,6 @@ impl<R: Read> Iterator for Entries<R> {
                     })));
                 }
             }
-        }
-    }
-}
-
-impl<R: Read> Read for FileEntry<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut st = self.state.borrow_mut();
-
-        if st.bytes_remaining == 0 {
-            st.consume_checksum()?;
-            return Ok(0);
-        }
-
-        let max = std::cmp::min(buf.len() as u64, st.bytes_remaining);
-        let n = st.reader.read(&mut buf[0..max as usize])?;
-
-        if n == 0 && st.bytes_remaining > 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Truncated file",
-            ));
-        }
-
-        st.bytes_remaining -= n as u64;
-
-        if st.bytes_remaining == 0 {
-            st.consume_checksum()?;
-        }
-        Ok(n)
-    }
-}
-
-impl<R: Read> Drop for FileEntry<R> {
-    fn drop(&mut self) {
-        let _ = self.state.borrow_mut().drain_active_file();
-    }
-}
-
-impl<R: Read> FileEntry<R> {
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-    pub fn metadata(&self) -> &Metadata {
-        &self.meta
-    }
-    pub fn enclosed_path(&self) -> PathBuf {
-        sanitize_path(&self.path)
-    }
-
-    pub fn crc64(&self) -> Option<u64> {
-        let st = self.state.borrow();
-
-        if st.bytes_remaining == 0 && st.checksum_consumed {
-            st.last_crc_valid
-        } else {
-            None
         }
     }
 }

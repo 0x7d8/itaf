@@ -1,8 +1,9 @@
-use std::cell::RefCell;
-use std::io::{self, Read};
-use std::rc::Rc;
-
 use crate::spec::{Decode, Entry as SpecEntry};
+use std::{
+    cell::RefCell,
+    io::{self, Read},
+    rc::Rc,
+};
 
 struct RawState<R> {
     reader: R,
