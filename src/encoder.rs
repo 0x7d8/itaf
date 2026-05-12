@@ -1,11 +1,11 @@
-use crate::spec::{Encode, Entry as RawEntry};
+use crate::spec::{Encode, Entry as RawEntry, FORMAT_VERSION, MAGIC, validate_name};
 use crc::{CRC_64_GO_ISO, Crc};
 use std::{
-    io::{self, Read, Write},
+    io::{Read, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-const CRC_ALG: Crc<u64> = Crc::<u64>::new(&CRC_64_GO_ISO);
+static CRC_ALG: Crc<u64> = Crc::<u64>::new(&CRC_64_GO_ISO);
 
 #[derive(Debug, Clone)]
 pub struct EncoderOptions {
@@ -54,7 +54,7 @@ pub struct ItafEncoder<W: Write> {
 }
 
 impl<W: Write> ItafEncoder<W> {
-    pub fn new(mut writer: W, options: EncoderOptions) -> io::Result<Self> {
+    pub fn new(mut writer: W, options: EncoderOptions) -> std::io::Result<Self> {
         let base_ts = options.base_timestamp.unwrap_or_else(|| {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -62,8 +62,8 @@ impl<W: Write> ItafEncoder<W> {
                 .as_nanos() as i64
         });
 
-        writer.write_all(b"ITAF")?;
-        writer.write_all(&[1])?;
+        writer.write_all(MAGIC)?;
+        writer.write_all(&[FORMAT_VERSION])?;
         writer.write_all(&base_ts.to_le_bytes())?;
 
         let flags = if options.crc_enabled { 1 } else { 0 };
@@ -80,14 +80,14 @@ impl<W: Write> ItafEncoder<W> {
         })
     }
 
-    pub fn finish(mut self) -> io::Result<W> {
+    pub fn finish(mut self) -> std::io::Result<W> {
         while !self.path_stack.is_empty() {
             self.exit_dir()?;
         }
         Ok(self.writer)
     }
 
-    fn ensure_metadata_state(&mut self, meta: &Metadata) -> io::Result<()> {
+    fn ensure_metadata_state(&mut self, meta: &Metadata) -> std::io::Result<()> {
         if meta.uid != self.current_uid
             || meta.gid != self.current_gid
             || meta.mode != self.current_mode
@@ -99,7 +99,6 @@ impl<W: Write> ItafEncoder<W> {
             };
             op.encode(&mut self.writer)?;
 
-            // Update internal state
             self.current_uid = meta.uid;
             self.current_gid = meta.gid;
             self.current_mode = meta.mode;
@@ -107,26 +106,38 @@ impl<W: Write> ItafEncoder<W> {
         Ok(())
     }
 
+    /// Compute a delta from the current time base. Uses saturating arithmetic
+    /// so that pathological timestamps (e.g. SystemTime values far outside the
+    /// representable range) don't wrap silently.
     fn calculate_time_delta(&self, time: SystemTime) -> i64 {
         let ns = time
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as i64;
-        ns.wrapping_sub(self.current_time_base)
+            .map(|d| d.as_nanos() as i128)
+            .unwrap_or_else(|e| -(e.duration().as_nanos() as i128));
+        let delta = ns - self.current_time_base as i128;
+        if delta > i64::MAX as i128 {
+            i64::MAX
+        } else if delta < i64::MIN as i128 {
+            i64::MIN
+        } else {
+            delta as i64
+        }
     }
 
     /// Adds a file to the archive.
     ///
-    /// - `name`: The filename (NOT path). Must be relative to the current directory stack.
-    /// - `size`: Must be known ahead of time.
-    /// - `content`: A reader to stream data from.
+    /// `size` must match the number of bytes available in `content`. The encoder
+    /// reads exactly `size` bytes; if `content` ends sooner it returns
+    /// `UnexpectedEof`, and if `content` still has data after `size` it returns
+    /// `InvalidInput` ("declared size shorter than source").
     pub fn add_file(
         &mut self,
         name: &str,
         meta: &Metadata,
         size: u64,
         content: &mut dyn Read,
-    ) -> io::Result<()> {
+    ) -> std::io::Result<()> {
+        validate_name(name)?;
         self.ensure_metadata_state(meta)?;
 
         let time_delta = self.calculate_time_delta(meta.modified);
@@ -144,7 +155,7 @@ impl<W: Write> ItafEncoder<W> {
             None
         };
 
-        let mut buf = [0u8; 16 * 1024];
+        let mut buf = vec![0u8; 64 * 1024];
         let mut written = 0u64;
 
         while written < size {
@@ -153,9 +164,9 @@ impl<W: Write> ItafEncoder<W> {
 
             let n = content.read(&mut buf[0..limit])?;
             if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Source reader ended before declared size",
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "source reader ended before declared size",
                 ));
             }
 
@@ -168,6 +179,19 @@ impl<W: Write> ItafEncoder<W> {
             written += n as u64;
         }
 
+        let mut probe = [0u8; 1];
+        match content.read(&mut probe) {
+            Ok(0) => {}
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "declared file size shorter than actual source length",
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+
         if let Some(d) = digest {
             let crc_val = d.finalize();
             self.writer.write_all(&crc_val.to_le_bytes())?;
@@ -177,7 +201,8 @@ impl<W: Write> ItafEncoder<W> {
     }
 
     /// Pushes a new directory onto the stack.
-    pub fn enter_dir(&mut self, name: &str, meta: &Metadata) -> io::Result<()> {
+    pub fn enter_dir(&mut self, name: &str, meta: &Metadata) -> std::io::Result<()> {
+        validate_name(name)?;
         self.ensure_metadata_state(meta)?;
         let time_delta = self.calculate_time_delta(meta.modified);
 
@@ -192,16 +217,14 @@ impl<W: Write> ItafEncoder<W> {
     }
 
     /// Pops the current directory from the stack.
-    pub fn exit_dir(&mut self) -> io::Result<()> {
+    pub fn exit_dir(&mut self) -> std::io::Result<()> {
         if self.path_stack.pop().is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
                 "Cannot exit dir: Root reached",
             ));
         }
-
-        let entry = RawEntry::DirExit;
-        entry.encode(&mut self.writer)?;
+        RawEntry::DirExit.encode(&mut self.writer)?;
         Ok(())
     }
 
@@ -211,7 +234,8 @@ impl<W: Write> ItafEncoder<W> {
         target: &str,
         target_is_dir: bool,
         meta: &Metadata,
-    ) -> io::Result<()> {
+    ) -> std::io::Result<()> {
+        validate_name(name)?;
         self.ensure_metadata_state(meta)?;
         let time_delta = self.calculate_time_delta(meta.modified);
 
@@ -225,8 +249,27 @@ impl<W: Write> ItafEncoder<W> {
         Ok(())
     }
 
+    pub fn add_hardlink(
+        &mut self,
+        name: &str,
+        target: &str,
+        meta: &Metadata,
+    ) -> std::io::Result<()> {
+        validate_name(name)?;
+        self.ensure_metadata_state(meta)?;
+        let time_delta = self.calculate_time_delta(meta.modified);
+
+        let entry = RawEntry::Hardlink {
+            name: name.to_string(),
+            target: target.to_string(),
+            time_delta_ns: time_delta,
+        };
+        entry.encode(&mut self.writer)?;
+        Ok(())
+    }
+
     /// Toggles checksum generation for subsequent files.
-    pub fn set_crc_enabled(&mut self, enabled: bool) -> io::Result<()> {
+    pub fn set_crc_enabled(&mut self, enabled: bool) -> std::io::Result<()> {
         if self.crc_enabled != enabled {
             let op = RawEntry::Meta {
                 has_crc: enabled,
@@ -239,7 +282,7 @@ impl<W: Write> ItafEncoder<W> {
     }
 
     /// Updates the base timestamp (e.g. for a new folder of old files).
-    pub fn set_base_time(&mut self, new_base_ns: i64) -> io::Result<()> {
+    pub fn set_base_time(&mut self, new_base_ns: i64) -> std::io::Result<()> {
         if self.current_time_base != new_base_ns {
             let op = RawEntry::Meta {
                 has_crc: self.crc_enabled,

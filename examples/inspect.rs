@@ -122,9 +122,27 @@ fn main() -> std::io::Result<()> {
                 println!("    Link Path:  {:?}", full_path);
                 println!("    Sym Time:   {:?}", abs_time);
             }
-            RawRecord::Other(data) => {
-                println!("  [INSTRUCTION: OTHER/EXT]");
-                println!("    Data: {:?}", data);
+            RawRecord::Hardlink {
+                name,
+                target,
+                time_delta_ns,
+            } => {
+                println!("  [INSTRUCTION: HARDLINK]");
+                println!("    Name:       '{}'", name);
+                println!("    Target:     '{}'", target);
+                println!("    Time Delta: {}", time_delta_ns);
+
+                let full_path = resolve_path(&path_stack, &name);
+                let abs_time = resolve_time(current_time_base, time_delta_ns);
+
+                println!("  [RESOLVED]");
+                println!("    Link Path:  {:?}", full_path);
+                println!("    Hard Time:  {:?}", abs_time);
+            }
+            RawRecord::Ext { type_id, data } => {
+                println!("  [INSTRUCTION: EXT]");
+                println!("    Type ID:    {}", type_id);
+                println!("    Data Len:   {} bytes", data.len());
             }
         }
         println!("------------------------------------------------------------");

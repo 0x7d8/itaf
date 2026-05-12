@@ -1,8 +1,5 @@
 use itaf::decoder::{ArchiveEntry, ItafDecoder};
-use std::{
-    fs::{self, File},
-    path::Path,
-};
+use std::{fs::File, path::Path};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -19,34 +16,25 @@ fn main() -> std::io::Result<()> {
     let file = File::open(input_path)?;
     let decoder = ItafDecoder::new(file)?;
 
-    // Iterate through the stream
     for entry_result in decoder.entries() {
         let mut entry = entry_result?;
 
-        // SECURITY: Always use enclosed_path() to prevent writing outside output_dir
         let safe_path = entry.enclosed_path();
         let target_path = output_dir.join(safe_path);
 
         match &mut entry {
             ArchiveEntry::Directory(_dir) => {
                 println!("Dir:  {:?}", target_path);
-                fs::create_dir_all(&target_path)?;
-
-                // Optionally set dir permissions/times here using dir.metadata()
+                std::fs::create_dir_all(&target_path)?;
             }
             ArchiveEntry::File(file_entry) => {
                 println!("File: {:?}", target_path);
-
-                // Ensure parent exists (though, it should always exist)
                 if let Some(parent) = target_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    std::fs::create_dir_all(parent)?;
                 }
-
-                // Create and write file
                 let mut out_file = File::create(&target_path)?;
                 let bytes_copied = std::io::copy(file_entry, &mut out_file)?;
 
-                // Optional: Check CRC manually (decoder checks automatically on drop/EOF)
                 if let Some(crc) = file_entry.crc64() {
                     println!("      -> Verified CRC64: {:016X}", crc);
                 }
@@ -59,33 +47,41 @@ fn main() -> std::io::Result<()> {
                     );
                 }
 
-                // Apply permissions (Basic Unix example)
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let meta = file_entry.metadata();
-                    let perms = fs::Permissions::from_mode(meta.mode);
-                    fs::set_permissions(&target_path, perms)?;
+                    let perms = std::fs::Permissions::from_mode(meta.mode);
+                    std::fs::set_permissions(&target_path, perms)?;
                 }
             }
             ArchiveEntry::Symlink(sym) => {
                 println!("Link: {:?} -> {:?}", target_path, sym.target());
-
                 if let Some(parent) = target_path.parent() {
-                    fs::create_dir_all(parent)?;
+                    std::fs::create_dir_all(parent)?;
                 }
-
                 #[cfg(unix)]
                 std::os::unix::fs::symlink(sym.target(), &target_path)?;
 
                 #[cfg(windows)]
                 {
-                    if sym.is_dir() {
+                    if sym.is_target_dir() {
                         std::os::windows::fs::symlink_dir(sym.target(), &target_path)?;
                     } else {
                         std::os::windows::fs::symlink_file(sym.target(), &target_path)?;
                     }
                 }
+            }
+            ArchiveEntry::Hardlink(hl) => {
+                println!("Hard: {:?} -> {:?}", target_path, hl.target());
+                if let Some(parent) = target_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let resolved_target = output_dir.join(hl.enclosed_target());
+                #[cfg(unix)]
+                std::fs::hard_link(&resolved_target, &target_path)?;
+                #[cfg(windows)]
+                std::fs::hard_link(&resolved_target, &target_path)?;
             }
         }
     }

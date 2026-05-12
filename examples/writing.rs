@@ -1,9 +1,5 @@
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
-use std::{
-    fs::{self, File},
-    path::Path,
-    time::SystemTime,
-};
+use std::{fs::File, path::Path, time::SystemTime};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -18,7 +14,6 @@ fn main() -> std::io::Result<()> {
     println!("Creating archive: {}", output_path);
     let file = File::create(output_path)?;
 
-    // Create Encoder with default options (CRC enabled)
     let options = EncoderOptions::default();
     let mut encoder = ItafEncoder::new(file, options)?;
 
@@ -37,18 +32,14 @@ fn main() -> std::io::Result<()> {
 }
 
 fn add_recursive(encoder: &mut ItafEncoder<File>, path: &Path) -> std::io::Result<()> {
-    // 1. Get filesystem metadata
-    let fs_meta = fs::symlink_metadata(path)?;
+    let fs_meta = std::fs::symlink_metadata(path)?;
     let file_type = fs_meta.file_type();
 
-    // 2. Get the filename (entry name)
     let name = match path.file_name() {
         Some(n) => n.to_string_lossy(),
         None => return Ok(()),
     };
 
-    // 3. Map fs::Metadata to itaf::Metadata
-    // Note: On Windows, uid/gid/mode will need defaults or specific handling
     let meta = Metadata {
         modified: fs_meta.modified().unwrap_or(SystemTime::now()),
         #[cfg(unix)]
@@ -69,7 +60,7 @@ fn add_recursive(encoder: &mut ItafEncoder<File>, path: &Path) -> std::io::Resul
         println!("Dir:  {}", path.display());
         encoder.enter_dir(&name, &meta)?;
 
-        for entry in fs::read_dir(path)? {
+        for entry in std::fs::read_dir(path)? {
             let entry = entry?;
             add_recursive(encoder, &entry.path())?;
         }
@@ -82,7 +73,7 @@ fn add_recursive(encoder: &mut ItafEncoder<File>, path: &Path) -> std::io::Resul
         encoder.add_file(&name, &meta, size, &mut f)?;
     } else if file_type.is_symlink() {
         println!("Link: {}", path.display());
-        let target = fs::read_link(path)?;
+        let target = std::fs::read_link(path)?;
         let target_str = target.to_string_lossy();
         encoder.add_symlink(&name, &target_str, false, &meta)?;
     }
