@@ -1,4 +1,4 @@
-use crate::spec::{Decode, DecodeLimits, Entry as RawEntry, FORMAT_VERSION, MAGIC};
+use crate::spec::{Decode, DecodeLimits, Entry as RawEntry, FORMAT_VERSION, MAGIC, name_depth};
 use crc::{CRC_64_GO_ISO, Crc};
 use std::{
     cell::RefCell,
@@ -49,10 +49,18 @@ impl<R: Read> FileEntry<R> {
         &self.meta
     }
 
+    /// The entry's path with `..` traversal resolved away, safe to join onto an
+    /// extraction root. Prefer this over [`Self::path`].
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(&self.path)
     }
 
+    /// The entry's path exactly as stored, **unsanitized**.
+    ///
+    /// Names come from whoever wrote the archive, so this may contain `..`
+    /// components and is root-anchored. Never join it onto an extraction root —
+    /// use [`Self::enclosed_path`] for that. This accessor is for display and
+    /// for callers doing their own containment.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -118,6 +126,8 @@ pub struct DirEntry {
 }
 
 impl DirEntry {
+    /// The entry's path exactly as stored, **unsanitized**. See
+    /// [`FileEntry::path`]; prefer [`Self::enclosed_path`] when extracting.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -126,6 +136,8 @@ impl DirEntry {
         &self.meta
     }
 
+    /// The entry's path with `..` traversal resolved away, safe to join onto an
+    /// extraction root.
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(&self.path)
     }
@@ -139,10 +151,18 @@ pub struct SymlinkEntry {
 }
 
 impl SymlinkEntry {
+    /// The entry's path exactly as stored, **unsanitized**. See
+    /// [`FileEntry::path`]; prefer [`Self::enclosed_path`] when extracting.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// The link target exactly as stored, **unsanitized**.
+    ///
+    /// Targets are unconstrained beyond being non-empty and NUL-free, so this
+    /// may be absolute or escape the archive root entirely. Creating a symlink
+    /// pointing here is only safe if you intend to reproduce the original link
+    /// verbatim; use [`Self::enclosed_target`] to confine it instead.
     pub fn target(&self) -> &Path {
         &self.target
     }
@@ -155,10 +175,14 @@ impl SymlinkEntry {
         &self.meta
     }
 
+    /// The entry's path with `..` traversal resolved away, safe to join onto an
+    /// extraction root.
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(&self.path)
     }
 
+    /// The link target with `..` traversal resolved away, confined to the
+    /// extraction root.
     pub fn enclosed_target(&self) -> PathBuf {
         sanitize_path(&self.target)
     }
@@ -171,10 +195,15 @@ pub struct HardlinkEntry {
 }
 
 impl HardlinkEntry {
+    /// The entry's path exactly as stored, **unsanitized**. See
+    /// [`FileEntry::path`]; prefer [`Self::enclosed_path`] when extracting.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// The link target exactly as stored, **unsanitized**. See
+    /// [`SymlinkEntry::target`]; prefer [`Self::enclosed_target`] when
+    /// extracting.
     pub fn target(&self) -> &Path {
         &self.target
     }
@@ -183,10 +212,14 @@ impl HardlinkEntry {
         &self.meta
     }
 
+    /// The entry's path with `..` traversal resolved away, safe to join onto an
+    /// extraction root.
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(&self.path)
     }
 
+    /// The link target with `..` traversal resolved away, confined to the
+    /// extraction root.
     pub fn enclosed_target(&self) -> PathBuf {
         sanitize_path(&self.target)
     }
@@ -200,6 +233,8 @@ pub enum ArchiveEntry<R: Read> {
 }
 
 impl<R: Read> ArchiveEntry<R> {
+    /// The entry's path exactly as stored, **unsanitized**. See
+    /// [`FileEntry::path`]; prefer [`Self::enclosed_path`] when extracting.
     pub fn path(&self) -> &Path {
         match self {
             Self::File(e) => &e.path,
@@ -209,6 +244,8 @@ impl<R: Read> ArchiveEntry<R> {
         }
     }
 
+    /// The entry's path with `..` traversal resolved away, safe to join onto an
+    /// extraction root. This is the accessor extraction code should use.
     pub fn enclosed_path(&self) -> PathBuf {
         sanitize_path(self.path())
     }
@@ -227,6 +264,9 @@ struct DecoderState<R> {
     reader: R,
     path_stack: Vec<String>,
     path_cache: PathBuf,
+    /// Directory levels currently open. Not `path_stack.len()`: a single frame
+    /// may be a compressed name like `world/region` worth two levels.
+    depth: usize,
 
     uid: u64,
     gid: u64,
@@ -248,6 +288,21 @@ impl<R: Read> DecoderState<R> {
         for segment in &self.path_stack {
             self.path_cache.push(segment);
         }
+    }
+
+    /// Reject a name that would open more directory levels than the limit
+    /// allows. `added` is the number of levels the name introduces, which is
+    /// every segment for a `DirEnter` and every segment but the last for a
+    /// leaf, so that a compressed name cannot outrun the limit that the
+    /// equivalent chain of `DirEnter`s would hit.
+    fn check_depth(&self, added: usize) -> std::io::Result<()> {
+        if self.depth + added > self.limits.max_depth {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("directory nesting exceeded limit {}", self.limits.max_depth),
+            ));
+        }
+        Ok(())
     }
 
     /// Compute a SystemTime from a base + delta using i128 to avoid wrap.
@@ -368,6 +423,7 @@ impl<R: Read> ItafDecoder<R> {
             reader,
             path_stack: Vec::new(),
             path_cache: PathBuf::from("/"),
+            depth: 0,
             uid: 0,
             gid: 0,
             mode: 0o644,
@@ -415,11 +471,14 @@ impl<R: Read> Iterator for Entries<R> {
 
             match raw_entry {
                 RawEntry::DirExit => {
-                    if st.path_stack.pop().is_none() {
-                        return Some(Err(Error::new(
-                            ErrorKind::InvalidData,
-                            "DirExit with empty directory stack",
-                        )));
+                    match st.path_stack.pop() {
+                        Some(popped) => st.depth -= name_depth(&popped),
+                        None => {
+                            return Some(Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "DirExit with empty directory stack",
+                            )));
+                        }
                     }
                     st.rebuild_path_cache();
                     continue;
@@ -442,6 +501,10 @@ impl<R: Read> Iterator for Entries<R> {
                     size,
                     time_delta_ns,
                 } => {
+                    if let Err(e) = st.check_depth(name_depth(&name) - 1) {
+                        return Some(Err(e));
+                    }
+
                     st.bytes_remaining = size;
                     st.checksum_consumed = false;
                     st.last_crc_verified = None;
@@ -471,14 +534,15 @@ impl<R: Read> Iterator for Entries<R> {
                     name,
                     time_delta_ns,
                 } => {
-                    if st.path_stack.len() >= st.limits.max_depth {
-                        return Some(Err(Error::new(
-                            ErrorKind::InvalidData,
-                            format!("directory nesting exceeded limit {}", st.limits.max_depth),
-                        )));
+                    let levels = name_depth(&name);
+                    if let Err(e) = st.check_depth(levels) {
+                        return Some(Err(e));
                     }
+
+                    st.depth += levels;
                     st.path_stack.push(name);
                     st.rebuild_path_cache();
+
                     let path = st.path_cache.clone();
                     let meta = Metadata {
                         uid: st.uid,
@@ -495,6 +559,10 @@ impl<R: Read> Iterator for Entries<R> {
                     is_dir,
                     time_delta_ns,
                 } => {
+                    if let Err(e) = st.check_depth(name_depth(&name) - 1) {
+                        return Some(Err(e));
+                    }
+
                     let path = st.path_cache.join(&name);
                     let meta = Metadata {
                         uid: st.uid,
@@ -503,6 +571,7 @@ impl<R: Read> Iterator for Entries<R> {
                         modified: st.resolve_time(time_delta_ns),
                     };
                     drop(st);
+
                     return Some(Ok(ArchiveEntry::Symlink(SymlinkEntry {
                         path,
                         target: PathBuf::from(target),
@@ -515,6 +584,10 @@ impl<R: Read> Iterator for Entries<R> {
                     target,
                     time_delta_ns,
                 } => {
+                    if let Err(e) = st.check_depth(name_depth(&name) - 1) {
+                        return Some(Err(e));
+                    }
+
                     let path = st.path_cache.join(&name);
                     let meta = Metadata {
                         uid: st.uid,
@@ -523,6 +596,7 @@ impl<R: Read> Iterator for Entries<R> {
                         modified: st.resolve_time(time_delta_ns),
                     };
                     drop(st);
+
                     return Some(Ok(ArchiveEntry::Hardlink(HardlinkEntry {
                         path,
                         target: PathBuf::from(target),

@@ -126,6 +126,10 @@ impl<W: Write> ItafEncoder<W> {
 
     /// Adds a file to the archive.
     ///
+    /// `name` may be a `/`-separated chain relative to the current directory,
+    /// which saves a `DirEnter`/`DirExit` pair per level for a file that is the
+    /// only thing in its directory.
+    ///
     /// `size` must match the number of bytes available in `content`. The encoder
     /// reads exactly `size` bytes; if `content` ends sooner it returns
     /// `UnexpectedEof`, and if `content` still has data after `size` it returns
@@ -201,6 +205,13 @@ impl<W: Write> ItafEncoder<W> {
     }
 
     /// Pushes a new directory onto the stack.
+    ///
+    /// `name` may be a `/`-separated chain (`world/region`), which opens every
+    /// level in one instruction instead of one `DirEnter` per level — worth it
+    /// whenever a directory has a single child. The whole chain is one stack
+    /// frame, so a single [`Self::exit_dir`] leaves all of it; the metadata
+    /// given here applies to the deepest level, and intermediate levels are
+    /// materialized by the extractor.
     pub fn enter_dir(&mut self, name: &str, meta: &Metadata) -> std::io::Result<()> {
         validate_name(name)?;
         self.ensure_metadata_state(meta)?;
@@ -216,7 +227,8 @@ impl<W: Write> ItafEncoder<W> {
         Ok(())
     }
 
-    /// Pops the current directory from the stack.
+    /// Pops the current directory from the stack, leaving every level a
+    /// compressed [`Self::enter_dir`] name opened.
     pub fn exit_dir(&mut self) -> std::io::Result<()> {
         if self.path_stack.pop().is_none() {
             return Err(std::io::Error::new(

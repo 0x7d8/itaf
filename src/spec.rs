@@ -182,23 +182,31 @@ pub fn validate_name(name: &str) -> std::io::Result<()> {
     if name.is_empty() {
         return Err(Error::new(ErrorKind::InvalidData, "empty entry name"));
     }
-    if name == "." || name == ".." {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "entry name must not be '.' or '..'",
-        ));
-    }
-    if name
-        .as_bytes()
-        .iter()
-        .any(|&b| b == b'/' || b == b'\\' || b == 0)
-    {
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "entry name contains forbidden character ('/', '\\\\' or NUL)",
-        ));
+    for segment in name.split('/') {
+        if segment.is_empty() {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "entry name has an empty path segment",
+            ));
+        }
+        if segment == "." || segment == ".." {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "entry name segment must not be '.' or '..'",
+            ));
+        }
+        if segment.as_bytes().contains(&0) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "entry name contains NUL",
+            ));
+        }
     }
     Ok(())
+}
+
+pub fn name_depth(name: &str) -> usize {
+    name.split('/').count()
 }
 
 fn validate_target(target: &str) -> std::io::Result<()> {
