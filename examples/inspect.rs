@@ -17,7 +17,7 @@ fn main() -> std::io::Result<()> {
 
     println!(" INSPECTING: {}", input_path);
 
-    let decoder = RawDecoder::new(file)?;
+    let decoder = RawDecoder::new(std::io::BufReader::new(file))?;
 
     println!("GLOBAL HEADER:");
     println!("  Base Timestamp: {} (Epoch ns)", decoder.base_timestamp);

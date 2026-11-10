@@ -1,5 +1,5 @@
 use itaf::decoder::{ArchiveEntry, ItafDecoder};
-use std::{fs::File, path::Path};
+use std::{fs::File, io::BufReader, path::Path};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -14,7 +14,7 @@ fn main() -> std::io::Result<()> {
     println!("Extracting {} to {}", input_path, output_dir.display());
 
     let file = File::open(input_path)?;
-    let decoder = ItafDecoder::new(file)?;
+    let decoder = ItafDecoder::new(BufReader::new(file))?;
 
     for entry_result in decoder.entries() {
         let mut entry = entry_result?;

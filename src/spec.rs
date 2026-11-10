@@ -1,4 +1,9 @@
+use crc::{CRC_64_GO_ISO, Crc, Table};
 use std::io::{Error, ErrorKind, Read, Write};
+
+pub(crate) type Crc64 = Crc<u64, Table<16>>;
+pub(crate) type Crc64Digest = crc::Digest<'static, u64, Table<16>>;
+pub(crate) static CRC64: Crc64 = Crc64::new(&CRC_64_GO_ISO);
 
 /// Decoder limits. The decoder enforces these to bound resource usage when
 /// reading archives from untrusted sources (network peers, user uploads, etc).
@@ -41,20 +46,78 @@ pub struct VarUint(pub u64);
 
 impl Encode for VarUint {
     fn encode(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        let mut buf = [0u8; 10];
+        let mut len = 0;
         let mut n = self.0;
-        loop {
-            let mut byte = (n & 0x7F) as u8;
+        while n >= 0x80 {
+            buf[len] = n as u8 | 0x80;
             n >>= 7;
-            if n != 0 {
-                byte |= 0x80;
-                writer.write_all(&[byte])?;
-            } else {
-                writer.write_all(&[byte])?;
-                break;
-            }
+            len += 1;
         }
-        Ok(())
+        buf[len] = n as u8;
+        writer.write_all(&buf[..=len])
     }
+}
+
+pub(crate) fn put_varuint(out: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        out.push(n as u8 | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+pub(crate) fn put_varint(out: &mut Vec<u8>, n: i64) {
+    put_varuint(out, ((n << 1) ^ (n >> 63)) as u64);
+}
+
+fn put_named(out: &mut Vec<u8>, opcode: Opcode, name: &str) {
+    let (immediate, extra) = encode_string_parts(name);
+    out.push(((opcode as u8) << 4) | immediate);
+    if let Some(len) = extra {
+        put_varuint(out, len.0);
+    }
+    out.extend_from_slice(name.as_bytes());
+}
+
+pub(crate) fn put_file(out: &mut Vec<u8>, name: &str, size: u64, time_delta_ns: i64) {
+    put_named(out, Opcode::File, name);
+    put_varuint(out, size);
+    put_varint(out, time_delta_ns);
+}
+
+pub(crate) fn put_dir_enter(out: &mut Vec<u8>, name: &str, time_delta_ns: i64) {
+    put_named(out, Opcode::DirEnter, name);
+    put_varint(out, time_delta_ns);
+}
+
+pub(crate) fn put_dir_exit(out: &mut Vec<u8>) {
+    out.push((Opcode::DirExit as u8) << 4);
+}
+
+pub(crate) fn put_meta(out: &mut Vec<u8>, has_crc: bool, time_base: i64) {
+    out.push(((Opcode::Meta as u8) << 4) | has_crc as u8);
+    put_varint(out, time_base);
+}
+
+pub(crate) fn put_unix_attr(out: &mut Vec<u8>, uid: u64, gid: u64, mode: u32) {
+    out.push((Opcode::UnixAttr as u8) << 4);
+    put_varuint(out, uid);
+    put_varuint(out, gid);
+    out.extend_from_slice(&mode.to_le_bytes());
+}
+
+pub(crate) fn put_link(
+    out: &mut Vec<u8>,
+    opcode: Opcode,
+    name: &str,
+    target: &str,
+    time_delta_ns: i64,
+) {
+    put_named(out, opcode, name);
+    put_varint(out, time_delta_ns);
+    put_varuint(out, target.len() as u64);
+    out.extend_from_slice(target.as_bytes());
 }
 
 impl VarUint {
@@ -163,12 +226,32 @@ impl Encode for InstructionTag {
 }
 
 impl InstructionTag {
+    fn from_byte(byte: u8) -> std::io::Result<Self> {
+        Ok(InstructionTag {
+            opcode: Opcode::from_u8(byte >> 4)?,
+            immediate: byte & 0x0F,
+        })
+    }
+
     pub fn decode_unchecked(reader: &mut dyn Read) -> std::io::Result<Self> {
         let mut buf = [0u8; 1];
         reader.read_exact(&mut buf)?;
-        let opcode = Opcode::from_u8(buf[0] >> 4)?;
-        let immediate = buf[0] & 0x0F;
-        Ok(InstructionTag { opcode, immediate })
+        Self::from_byte(buf[0])
+    }
+
+    /// Reads the next tag, or `None` if the stream ends cleanly before it.
+    /// Only an end of stream at this exact position is a complete archive;
+    /// anywhere inside an instruction it is a truncation.
+    pub fn decode_or_eof(reader: &mut dyn Read) -> std::io::Result<Option<Self>> {
+        let mut buf = [0u8; 1];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return Ok(None),
+                Ok(_) => return Self::from_byte(buf[0]).map(Some),
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
 }
 
@@ -209,7 +292,7 @@ pub fn name_depth(name: &str) -> usize {
     name.split('/').count()
 }
 
-fn validate_target(target: &str) -> std::io::Result<()> {
+pub(crate) fn validate_target(target: &str) -> std::io::Result<()> {
     if target.is_empty() {
         return Err(Error::new(ErrorKind::InvalidData, "empty link target"));
     }
@@ -306,6 +389,7 @@ pub enum Entry {
 
 impl Encode for Entry {
     fn encode(&self, writer: &mut dyn Write) -> std::io::Result<()> {
+        let mut out = Vec::new();
         match self {
             Entry::File {
                 name,
@@ -313,64 +397,18 @@ impl Encode for Entry {
                 time_delta_ns,
             } => {
                 validate_name(name)?;
-                let (imm, extra) = encode_string_parts(name);
-                InstructionTag {
-                    opcode: Opcode::File,
-                    immediate: imm,
-                }
-                .encode(writer)?;
-                if let Some(v) = extra {
-                    v.encode(writer)?;
-                }
-                writer.write_all(name.as_bytes())?;
-                VarUint(*size).encode(writer)?;
-                VarInt(*time_delta_ns).encode(writer)?;
-                Ok(())
+                put_file(&mut out, name, *size, *time_delta_ns);
             }
             Entry::DirEnter {
                 name,
                 time_delta_ns,
             } => {
                 validate_name(name)?;
-                let (imm, extra) = encode_string_parts(name);
-                InstructionTag {
-                    opcode: Opcode::DirEnter,
-                    immediate: imm,
-                }
-                .encode(writer)?;
-                if let Some(v) = extra {
-                    v.encode(writer)?;
-                }
-                writer.write_all(name.as_bytes())?;
-                VarInt(*time_delta_ns).encode(writer)?;
-                Ok(())
+                put_dir_enter(&mut out, name, *time_delta_ns);
             }
-            Entry::DirExit => InstructionTag {
-                opcode: Opcode::DirExit,
-                immediate: 0,
-            }
-            .encode(writer),
-            Entry::Meta { has_crc, time_base } => {
-                let imm = if *has_crc { 1 } else { 0 };
-                InstructionTag {
-                    opcode: Opcode::Meta,
-                    immediate: imm,
-                }
-                .encode(writer)?;
-                VarInt(*time_base).encode(writer)?;
-                Ok(())
-            }
-            Entry::UnixAttr { uid, gid, mode } => {
-                InstructionTag {
-                    opcode: Opcode::UnixAttr,
-                    immediate: 0,
-                }
-                .encode(writer)?;
-                VarUint(*uid).encode(writer)?;
-                VarUint(*gid).encode(writer)?;
-                writer.write_all(&mode.to_le_bytes())?;
-                Ok(())
-            }
+            Entry::DirExit => put_dir_exit(&mut out),
+            Entry::Meta { has_crc, time_base } => put_meta(&mut out, *has_crc, *time_base),
+            Entry::UnixAttr { uid, gid, mode } => put_unix_attr(&mut out, *uid, *gid, *mode),
             Entry::Symlink {
                 name,
                 target,
@@ -384,21 +422,7 @@ impl Encode for Entry {
                 } else {
                     Opcode::SymFile
                 };
-                let (imm, extra) = encode_string_parts(name);
-                InstructionTag {
-                    opcode,
-                    immediate: imm,
-                }
-                .encode(writer)?;
-                if let Some(v) = extra {
-                    v.encode(writer)?;
-                }
-                writer.write_all(name.as_bytes())?;
-                VarInt(*time_delta_ns).encode(writer)?;
-
-                VarUint(target.len() as u64).encode(writer)?;
-                writer.write_all(target.as_bytes())?;
-                Ok(())
+                put_link(&mut out, opcode, name, target, *time_delta_ns);
             }
             Entry::Hardlink {
                 name,
@@ -407,21 +431,7 @@ impl Encode for Entry {
             } => {
                 validate_name(name)?;
                 validate_target(target)?;
-                let (imm, extra) = encode_string_parts(name);
-                InstructionTag {
-                    opcode: Opcode::HardLink,
-                    immediate: imm,
-                }
-                .encode(writer)?;
-                if let Some(v) = extra {
-                    v.encode(writer)?;
-                }
-                writer.write_all(name.as_bytes())?;
-                VarInt(*time_delta_ns).encode(writer)?;
-
-                VarUint(target.len() as u64).encode(writer)?;
-                writer.write_all(target.as_bytes())?;
-                Ok(())
+                put_link(&mut out, Opcode::HardLink, name, target, *time_delta_ns);
             }
             Entry::Ext { type_id, data } => {
                 if *type_id > 15 {
@@ -430,23 +440,29 @@ impl Encode for Entry {
                         "Ext type_id must fit in 4-bit immediate",
                     ));
                 }
-                InstructionTag {
-                    opcode: Opcode::Ext,
-                    immediate: *type_id,
-                }
-                .encode(writer)?;
-                VarUint(data.len() as u64).encode(writer)?;
-                writer.write_all(data)?;
-                Ok(())
+                out.push(((Opcode::Ext as u8) << 4) | *type_id);
+                put_varuint(&mut out, data.len() as u64);
+                out.extend_from_slice(data);
             }
         }
+        writer.write_all(&out)
     }
 }
 
 impl Decode for Entry {
     fn decode(reader: &mut dyn Read, limits: &DecodeLimits) -> std::io::Result<Self> {
         let tag = InstructionTag::decode_unchecked(reader)?;
+        Self::decode_body(tag, reader, limits)
+    }
+}
 
+impl Entry {
+    /// Decodes the rest of an instruction whose tag has already been read.
+    pub fn decode_body(
+        tag: InstructionTag,
+        reader: &mut dyn Read,
+        limits: &DecodeLimits,
+    ) -> std::io::Result<Self> {
         match tag.opcode {
             Opcode::File => {
                 let name = decode_name(reader, tag.immediate, limits)?;

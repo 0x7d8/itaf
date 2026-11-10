@@ -1,11 +1,50 @@
-use crate::spec::{Encode, Entry as RawEntry, FORMAT_VERSION, MAGIC, validate_name};
-use crc::{CRC_64_GO_ISO, Crc};
+use crate::spec::{
+    CRC64, FORMAT_VERSION, MAGIC, Opcode, put_dir_enter, put_dir_exit, put_file, put_link,
+    put_meta, put_unix_attr, validate_name, validate_target,
+};
 use std::{
-    io::{Read, Write},
+    io::{Error, ErrorKind, Read, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-static CRC_ALG: Crc<u64> = Crc::<u64>::new(&CRC_64_GO_ISO);
+const COPY_CHUNK: usize = 64 * 1024;
+/// Files up to this size are staged in memory together with their header and
+/// checksum, so they reach the writer in a single call.
+const INLINE_MAX: u64 = 32 * 1024;
+
+fn read_full(content: &mut dyn Read, mut buf: &mut [u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match content.read(buf) {
+            Ok(0) => {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "source reader ended before declared size",
+                ));
+            }
+            Ok(n) => buf = &mut buf[n..],
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+fn expect_end(content: &mut dyn Read) -> std::io::Result<()> {
+    let mut probe = [0u8; 1];
+    loop {
+        match content.read(&mut probe) {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "declared file size shorter than actual source length",
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EncoderOptions {
@@ -44,7 +83,11 @@ impl Default for Metadata {
 pub struct ItafEncoder<W: Write> {
     writer: W,
 
-    path_stack: Vec<String>,
+    open_dirs: usize,
+    scratch: Vec<u8>,
+    /// Set once a write failed or a file payload was left incomplete: the
+    /// output can no longer be continued into a valid archive.
+    poisoned: bool,
 
     current_uid: u64,
     current_gid: u64,
@@ -62,16 +105,18 @@ impl<W: Write> ItafEncoder<W> {
                 .as_nanos() as i64
         });
 
-        writer.write_all(MAGIC)?;
-        writer.write_all(&[FORMAT_VERSION])?;
-        writer.write_all(&base_ts.to_le_bytes())?;
-
-        let flags = if options.crc_enabled { 1 } else { 0 };
-        writer.write_all(&[flags])?;
+        let mut header = [0u8; 14];
+        header[..4].copy_from_slice(MAGIC);
+        header[4] = FORMAT_VERSION;
+        header[5..13].copy_from_slice(&base_ts.to_le_bytes());
+        header[13] = options.crc_enabled as u8;
+        writer.write_all(&header)?;
 
         Ok(Self {
             writer,
-            path_stack: Vec::new(),
+            open_dirs: 0,
+            scratch: Vec::new(),
+            poisoned: false,
             current_uid: 0,
             current_gid: 0,
             current_mode: 0o644,
@@ -80,30 +125,48 @@ impl<W: Write> ItafEncoder<W> {
         })
     }
 
+    /// Closes every directory still open and returns the writer.
+    ///
+    /// Fails if an earlier call left the archive incomplete (see
+    /// [`Self::add_file`]).
     pub fn finish(mut self) -> std::io::Result<W> {
-        while !self.path_stack.is_empty() {
-            self.exit_dir()?;
+        self.begin()?;
+        for _ in 0..self.open_dirs {
+            put_dir_exit(&mut self.scratch);
         }
+        self.flush_scratch()?;
         Ok(self.writer)
     }
 
-    fn ensure_metadata_state(&mut self, meta: &Metadata) -> std::io::Result<()> {
+    fn begin(&mut self) -> std::io::Result<()> {
+        if self.poisoned {
+            return Err(Error::other(
+                "encoder is unusable: an earlier error left the archive incomplete",
+            ));
+        }
+        self.scratch.clear();
+        Ok(())
+    }
+
+    fn flush_scratch(&mut self) -> std::io::Result<()> {
+        let result = self.writer.write_all(&self.scratch);
+        self.poisoned |= result.is_err();
+        result
+    }
+
+    fn stage_metadata(&mut self, meta: &Metadata) {
         if meta.uid != self.current_uid
             || meta.gid != self.current_gid
             || meta.mode != self.current_mode
         {
-            let op = RawEntry::UnixAttr {
-                uid: meta.uid,
-                gid: meta.gid,
-                mode: meta.mode,
-            };
-            op.encode(&mut self.writer)?;
-
-            self.current_uid = meta.uid;
-            self.current_gid = meta.gid;
-            self.current_mode = meta.mode;
+            put_unix_attr(&mut self.scratch, meta.uid, meta.gid, meta.mode);
         }
-        Ok(())
+    }
+
+    fn commit_metadata(&mut self, meta: &Metadata) {
+        self.current_uid = meta.uid;
+        self.current_gid = meta.gid;
+        self.current_mode = meta.mode;
     }
 
     /// Compute a delta from the current time base. Uses saturating arithmetic
@@ -133,7 +196,15 @@ impl<W: Write> ItafEncoder<W> {
     /// `size` must match the number of bytes available in `content`. The encoder
     /// reads exactly `size` bytes; if `content` ends sooner it returns
     /// `UnexpectedEof`, and if `content` still has data after `size` it returns
-    /// `InvalidInput` ("declared size shorter than source").
+    /// `InvalidInput` ("declared size shorter than source"). Detecting the
+    /// latter reads one byte past `size`, so pass `content.take(size)` when the
+    /// source is a longer stream that must not be consumed further.
+    ///
+    /// If this fails after part of the file has reached the writer, the
+    /// archive cannot be completed and every later call on this encoder,
+    /// including [`Self::finish`], returns an error. Small files are checked
+    /// against `size` before anything is written, so a size mismatch on one
+    /// leaves the encoder usable.
     pub fn add_file(
         &mut self,
         name: &str,
@@ -142,65 +213,64 @@ impl<W: Write> ItafEncoder<W> {
         content: &mut dyn Read,
     ) -> std::io::Result<()> {
         validate_name(name)?;
-        self.ensure_metadata_state(meta)?;
-
+        self.begin()?;
+        self.stage_metadata(meta);
         let time_delta = self.calculate_time_delta(meta.modified);
+        put_file(&mut self.scratch, name, size, time_delta);
 
-        let entry = RawEntry::File {
-            name: name.to_string(),
-            size,
-            time_delta_ns: time_delta,
-        };
-        entry.encode(&mut self.writer)?;
-
-        let mut digest = if self.crc_enabled {
-            Some(CRC_ALG.digest())
-        } else {
-            None
-        };
-
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut written = 0u64;
-
-        while written < size {
-            let remaining = size - written;
-            let limit = std::cmp::min(buf.len() as u64, remaining) as usize;
-
-            let n = content.read(&mut buf[0..limit])?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "source reader ended before declared size",
-                ));
+        if size <= INLINE_MAX {
+            let payload_at = self.scratch.len();
+            self.scratch.resize(payload_at + size as usize, 0);
+            read_full(content, &mut self.scratch[payload_at..])?;
+            expect_end(content)?;
+            if self.crc_enabled {
+                let crc = CRC64.checksum(&self.scratch[payload_at..]);
+                self.scratch.extend_from_slice(&crc.to_le_bytes());
             }
+            self.flush_scratch()?;
+            self.commit_metadata(meta);
+            return Ok(());
+        }
 
-            self.writer.write_all(&buf[..n])?;
+        self.flush_scratch()?;
+        self.commit_metadata(meta);
 
+        let result = self.copy_payload(size, content);
+        self.poisoned |= result.is_err();
+        result
+    }
+
+    fn copy_payload(&mut self, size: u64, content: &mut dyn Read) -> std::io::Result<()> {
+        let mut digest = self.crc_enabled.then(|| CRC64.digest());
+
+        self.scratch.resize(COPY_CHUNK, 0);
+        let mut remaining = size;
+        while remaining > 0 {
+            let limit = std::cmp::min(COPY_CHUNK as u64, remaining) as usize;
+            let n = match content.read(&mut self.scratch[..limit]) {
+                Ok(0) => {
+                    return Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "source reader ended before declared size",
+                    ));
+                }
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+
+            self.writer.write_all(&self.scratch[..n])?;
             if let Some(d) = &mut digest {
-                d.update(&buf[..n]);
+                d.update(&self.scratch[..n]);
             }
-
-            written += n as u64;
+            remaining -= n as u64;
         }
 
-        let mut probe = [0u8; 1];
-        match content.read(&mut probe) {
-            Ok(0) => {}
-            Ok(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "declared file size shorter than actual source length",
-                ));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(err) => return Err(err),
-        }
+        expect_end(content)?;
 
         if let Some(d) = digest {
-            let crc_val = d.finalize();
-            self.writer.write_all(&crc_val.to_le_bytes())?;
+            self.writer.write_all(&d.finalize().to_le_bytes())?;
         }
-
         Ok(())
     }
 
@@ -214,29 +284,48 @@ impl<W: Write> ItafEncoder<W> {
     /// materialized by the extractor.
     pub fn enter_dir(&mut self, name: &str, meta: &Metadata) -> std::io::Result<()> {
         validate_name(name)?;
-        self.ensure_metadata_state(meta)?;
+        self.begin()?;
+        self.stage_metadata(meta);
         let time_delta = self.calculate_time_delta(meta.modified);
+        put_dir_enter(&mut self.scratch, name, time_delta);
+        self.flush_scratch()?;
+        self.commit_metadata(meta);
 
-        let entry = RawEntry::DirEnter {
-            name: name.to_string(),
-            time_delta_ns: time_delta,
-        };
-        entry.encode(&mut self.writer)?;
-
-        self.path_stack.push(name.to_string());
+        self.open_dirs += 1;
         Ok(())
     }
 
     /// Pops the current directory from the stack, leaving every level a
     /// compressed [`Self::enter_dir`] name opened.
     pub fn exit_dir(&mut self) -> std::io::Result<()> {
-        if self.path_stack.pop().is_none() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+        if self.open_dirs == 0 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
                 "Cannot exit dir: Root reached",
             ));
         }
-        RawEntry::DirExit.encode(&mut self.writer)?;
+        self.begin()?;
+        put_dir_exit(&mut self.scratch);
+        self.flush_scratch()?;
+        self.open_dirs -= 1;
+        Ok(())
+    }
+
+    fn add_link(
+        &mut self,
+        opcode: Opcode,
+        name: &str,
+        target: &str,
+        meta: &Metadata,
+    ) -> std::io::Result<()> {
+        validate_name(name)?;
+        validate_target(target)?;
+        self.begin()?;
+        self.stage_metadata(meta);
+        let time_delta = self.calculate_time_delta(meta.modified);
+        put_link(&mut self.scratch, opcode, name, target, time_delta);
+        self.flush_scratch()?;
+        self.commit_metadata(meta);
         Ok(())
     }
 
@@ -247,18 +336,12 @@ impl<W: Write> ItafEncoder<W> {
         target_is_dir: bool,
         meta: &Metadata,
     ) -> std::io::Result<()> {
-        validate_name(name)?;
-        self.ensure_metadata_state(meta)?;
-        let time_delta = self.calculate_time_delta(meta.modified);
-
-        let entry = RawEntry::Symlink {
-            name: name.to_string(),
-            target: target.to_string(),
-            is_dir: target_is_dir,
-            time_delta_ns: time_delta,
+        let opcode = if target_is_dir {
+            Opcode::SymDir
+        } else {
+            Opcode::SymFile
         };
-        entry.encode(&mut self.writer)?;
-        Ok(())
+        self.add_link(opcode, name, target, meta)
     }
 
     pub fn add_hardlink(
@@ -267,27 +350,15 @@ impl<W: Write> ItafEncoder<W> {
         target: &str,
         meta: &Metadata,
     ) -> std::io::Result<()> {
-        validate_name(name)?;
-        self.ensure_metadata_state(meta)?;
-        let time_delta = self.calculate_time_delta(meta.modified);
-
-        let entry = RawEntry::Hardlink {
-            name: name.to_string(),
-            target: target.to_string(),
-            time_delta_ns: time_delta,
-        };
-        entry.encode(&mut self.writer)?;
-        Ok(())
+        self.add_link(Opcode::HardLink, name, target, meta)
     }
 
     /// Toggles checksum generation for subsequent files.
     pub fn set_crc_enabled(&mut self, enabled: bool) -> std::io::Result<()> {
         if self.crc_enabled != enabled {
-            let op = RawEntry::Meta {
-                has_crc: enabled,
-                time_base: self.current_time_base,
-            };
-            op.encode(&mut self.writer)?;
+            self.begin()?;
+            put_meta(&mut self.scratch, enabled, self.current_time_base);
+            self.flush_scratch()?;
             self.crc_enabled = enabled;
         }
         Ok(())
@@ -296,11 +367,9 @@ impl<W: Write> ItafEncoder<W> {
     /// Updates the base timestamp (e.g. for a new folder of old files).
     pub fn set_base_time(&mut self, new_base_ns: i64) -> std::io::Result<()> {
         if self.current_time_base != new_base_ns {
-            let op = RawEntry::Meta {
-                has_crc: self.crc_enabled,
-                time_base: new_base_ns,
-            };
-            op.encode(&mut self.writer)?;
+            self.begin()?;
+            put_meta(&mut self.scratch, self.crc_enabled, new_base_ns);
+            self.flush_scratch()?;
             self.current_time_base = new_base_ns;
         }
         Ok(())

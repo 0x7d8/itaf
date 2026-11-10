@@ -1,5 +1,10 @@
 use itaf::encoder::{EncoderOptions, ItafEncoder, Metadata};
-use std::{fs::File, path::Path, time::SystemTime};
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
+    path::Path,
+    time::SystemTime,
+};
 
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -15,7 +20,7 @@ fn main() -> std::io::Result<()> {
     let file = File::create(output_path)?;
 
     let options = EncoderOptions::default();
-    let mut encoder = ItafEncoder::new(file, options)?;
+    let mut encoder = ItafEncoder::new(BufWriter::new(file), options)?;
 
     for path_str in input_paths {
         let path = Path::new(path_str);
@@ -26,12 +31,12 @@ fn main() -> std::io::Result<()> {
         add_recursive(&mut encoder, path)?;
     }
 
-    encoder.finish()?;
+    encoder.finish()?.flush()?;
     println!("Done.");
     Ok(())
 }
 
-fn add_recursive(encoder: &mut ItafEncoder<File>, path: &Path) -> std::io::Result<()> {
+fn add_recursive(encoder: &mut ItafEncoder<BufWriter<File>>, path: &Path) -> std::io::Result<()> {
     let fs_meta = std::fs::symlink_metadata(path)?;
     let file_type = fs_meta.file_type();
 
